@@ -108,9 +108,17 @@ WARNING
         install_binaries
         run_assets_precompile_rake_task
       end
+      config_detect
       best_practice_warnings
+      cleanup
       super
     end
+  end
+
+  def cleanup
+  end
+
+  def config_detect
   end
 
 private
@@ -376,6 +384,43 @@ WARNING
 
     true
   rescue LanguagePack::Fetcher::FetchError => error
+    if stack == "heroku-18" && ruby_version.version_for_download.match?(/ruby-2\.(2|3)/)
+      message = <<ERROR
+An error occurred while installing #{ruby_version.version_for_download}
+
+This version of Ruby is not available on Heroku-18. The minimum supported version
+of Ruby on the Heroku-18 stack can found at:
+
+  https://devcenter.heroku.com/articles/ruby-support#supported-runtimes
+
+ERROR
+
+      ci_message = <<ERROR
+
+If you did not intend to build your app for CI on the Heroku-18 stack
+please set your stack version manually in the `app.json`:
+
+```
+"stack": "heroku-16"
+```
+
+More information about this change in behavior can be found at:
+  https://help.heroku.com/3Y1HEXGJ/why-doesn-t-ruby-2-3-7-work-in-my-ci-tests
+
+ERROR
+
+      if env("CI")
+        mcount "fail.bad_version_fetch.heroku-18.ci"
+        message << ci_message
+      else
+        mcount "fail.bad_version_fetch.heroku-18"
+      end
+
+      error message
+    end
+
+    mcount "fail.bad_version_fetch"
+    mcount "fail.bad_version_fetch.#{ruby_version.version_for_download}"
     message = <<ERROR
 An error occurred while installing #{ruby_version.version_for_download}
 
@@ -426,7 +471,7 @@ ERROR
   # setup the environment so we can use the vendored ruby
   def setup_ruby_install_env
     instrument 'ruby.setup_ruby_install_env' do
-      ENV["PATH"] = "#{ruby_install_binstub_path}:#{ENV["PATH"]}"
+      ENV["PATH"] = "#{File.expand_path(ruby_install_binstub_path)}:#{ENV["PATH"]}"
 
       if ruby_version.jruby?
         ENV['JAVA_OPTS']  = default_java_opts
@@ -441,6 +486,10 @@ ERROR
       Dir.chdir(slug_vendor_base) do |dir|
         `cp -R #{bundler.bundler_path}/. .`
       end
+
+      # write bundler shim, so we can control the version bundler used
+      # Ruby 2.6.0 started vendoring bundler
+      write_bundler_shim("vendor/bundle/bin") if ruby_version.vendored_bundler?
     end
   end
 
@@ -512,6 +561,12 @@ ERROR
   # install libyaml into the LP to be referenced for psych compilation
   # @param [String] tmpdir to store the libyaml files
   def install_libyaml(dir)
+    case stack
+    when "cedar-14", "heroku-16"
+    else
+      return
+    end
+
     instrument 'ruby.install_libyaml' do
       FileUtils.mkdir_p dir
       Dir.chdir(dir) do
@@ -538,6 +593,40 @@ WARNING
 
   def bundler_binstubs_path
     "vendor/bundle/bin"
+  end
+
+  def bundler_path
+    @bundler_path ||= "#{slug_vendor_base}/gems/#{BUNDLER_GEM_PATH}"
+  end
+
+  def write_bundler_shim(path)
+    FileUtils.mkdir_p(path)
+    shim_path = "#{path}/bundle"
+    File.open(shim_path, "w") do |file|
+      file.print <<-BUNDLE
+#!/usr/bin/env ruby
+require 'rubygems'
+
+version = "#{BUNDLER_VERSION}"
+
+if ARGV.first
+  str = ARGV.first
+  str = str.dup.force_encoding("BINARY") if str.respond_to? :force_encoding
+  if str =~ /\A_(.*)_\z/ and Gem::Version.correct?($1) then
+    version = $1
+    ARGV.shift
+  end
+end
+
+if Gem.respond_to?(:activate_bin_path)
+load Gem.activate_bin_path('bundler', 'bundle', version)
+else
+gem "bundler", version
+load Gem.bin_path("bundler", "bundle", version)
+end
+BUNDLE
+    end
+    FileUtils.chmod(0755, shim_path)
   end
 
   # runs bundler to install the dependencies
@@ -599,9 +688,13 @@ WARNING
             "CPPATH"                        => noshellescape("#{yaml_include}:$CPPATH"),
             "LIBRARY_PATH"                  => noshellescape("#{yaml_lib}:$LIBRARY_PATH"),
             "RUBYOPT"                       => syck_hack,
-            "NOKOGIRI_USE_SYSTEM_LIBRARIES" => "true"
+            "NOKOGIRI_USE_SYSTEM_LIBRARIES" => "true",
+            "BUNDLE_DISABLE_VERSION_CHECK"  => "true"
           }
-          env_vars["BUNDLER_LIB_PATH"] = "#{bundler_path}" if ruby_version.ruby_version == "1.8.7"
+          env_vars["JAVA_HOME"]                    = noshellescape("#{pwd}/$JAVA_HOME") if ruby_version.jruby?
+          env_vars["BUNDLER_LIB_PATH"]             = "#{bundler_path}" if ruby_version.ruby_version == "1.8.7"
+          env_vars["BUNDLE_DISABLE_VERSION_CHECK"] = "true"
+
           puts "Running: #{bundle_command}"
           instrument "ruby.bundle_install" do
             bundle_time = Benchmark.realtime do
@@ -627,10 +720,12 @@ WARNING
           # Keep gem cache out of the slug
           FileUtils.rm_rf("#{slug_vendor_base}/cache")
         else
+          mcount "fail.bundle.install"
           log "bundle", :status => "failure"
           error_message = "Failed to install gems via Bundler."
           puts "Bundler Output: #{bundler_output}"
           if bundler_output.match(/An error occurred while installing sqlite3/)
+            mcount "fail.sqlite3"
             error_message += <<-ERROR
 
 Detected sqlite3 gem which is not supported on Heroku:
@@ -639,10 +734,19 @@ https://devcenter.heroku.com/articles/sqlite3
           end
 
           if bundler_output.match(/but your Gemfile specified/)
+            mcount "fail.ruby_version_mismatch"
             error_message += <<-ERROR
 
 Detected a mismatch between your Ruby version installed and
-Ruby version specified in Gemfile or Gemfile.lock:
+Ruby version specified in Gemfile or Gemfile.lock. You can
+correct this by running:
+
+    $ bundle update --ruby
+    $ git add Gemfile.lock
+    $ git commit -m "update ruby version"
+
+If this does not solve the issue please see this documentation:
+
 https://devcenter.heroku.com/articles/ruby-versions#your-ruby-version-is-x-but-your-gemfile-specified-y
             ERROR
           end
@@ -868,12 +972,22 @@ params = CGI.parse(uri.query || "")
   end
 
   def precompile_fail(output)
+    mcount "fail.assets_precompile"
     log "assets_precompile", :status => "failure"
     msg = "Precompiling assets failed.\n"
     if output.match(/(127\.0\.0\.1)|(org\.postgresql\.util)/)
       msg << "Attempted to access a nonexistent database:\n"
       msg << "https://devcenter.heroku.com/articles/pre-provision-database\n"
     end
+
+    sprockets_version = bundler.gem_version('sprockets')
+    if output.match(/Sprockets::FileNotFound/) && (sprockets_version < Gem::Version.new('4.0.0.beta7') && sprockets_version > Gem::Version.new('4.0.0.beta4'))
+      mcount "fail.assets_precompile.file_not_found_beta"
+      msg << "If you have this file in your project\n"
+      msg << "try upgrading to Sprockets 4.0.0.beta7 or later:\n"
+      msg << "https://github.com/rails/sprockets/pull/547\n"
+    end
+
     error msg
   end
 
